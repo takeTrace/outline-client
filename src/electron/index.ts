@@ -26,7 +26,7 @@ import * as connectivity from './connectivity';
 import * as errors from '../www/model/errors';
 
 import {ConnectionStore, SerializableConnection} from './connection_store';
-import * as process_manager from './process_manager';
+import {ConnectionManager} from './process_manager';
 
 // Used for the auto-connect feature. There will be a connection in store
 // if the user was connected at shutdown.
@@ -58,9 +58,14 @@ const enum Options {
   AUTOSTART = '--autostart'
 }
 
+const REACHABILITY_TIMEOUT_MS = 10000;
+
+let currentConnection: ConnectionManager|undefined;
+
 function createWindow(connectionAtShutdown?: SerializableConnection) {
   // Create the browser window.
-  mainWindow = new BrowserWindow({width: 360, height: 640, resizable: false});
+  mainWindow = new BrowserWindow(
+      {width: 360, height: 640, resizable: false, webPreferences: {nodeIntegration: true}});
 
   const pathToIndexHtml = path.join(app.getAppPath(), 'www', 'electron_index.html');
   const webAppUrl = new url.URL(`file://${pathToIndexHtml}`);
@@ -99,12 +104,18 @@ function createWindow(connectionAtShutdown?: SerializableConnection) {
   mainWindow.webContents.on('did-finish-load', () => {
     mainWindow!.webContents.send('localizationRequest', Object.keys(localizedStrings));
     interceptShadowsocksLink(process.argv);
+
     if (connectionAtShutdown) {
-      const serverId = connectionAtShutdown.id;
-      console.info(`Automatically starting connection ${serverId}`);
-      sendConnectionStatus(ConnectionStatus.RECONNECTING, serverId);
-      // TODO: Handle errors, report.
-      startVpn(connectionAtShutdown.config, serverId, true);
+      console.info(`was connected at shutdown, reconnecting to ${connectionAtShutdown.id}`);
+      sendConnectionStatus(ConnectionStatus.RECONNECTING, connectionAtShutdown.id);
+      startVpn(connectionAtShutdown.config, connectionAtShutdown.id, true)
+          .then(
+              () => {
+                console.log(`reconnected to ${connectionAtShutdown.id}`);
+              },
+              (e) => {
+                console.error(`could not reconnect: ${e.name} (${e.message})`);
+              });
     }
   });
 
@@ -161,12 +172,18 @@ function createTrayIconImage(imageName: string) {
 
 // Signals that the app is quitting and quits the app. This is necessary because we override the
 // window 'close' event to support minimizing to the system tray.
-function quitApp() {
+async function quitApp() {
   isAppQuitting = true;
+  await stopVpn();
   app.quit();
 }
 
-const isSecondInstance = app.makeSingleInstance((argv, workingDirectory) => {
+if (!app.requestSingleInstanceLock()) {
+  console.log('another instance is running - exiting');
+  app.quit();
+}
+
+app.on('second-instance', (event: Event, argv: string[]) => {
   interceptShadowsocksLink(argv);
 
   // Someone tried to run a second instance, we should focus our window.
@@ -178,10 +195,6 @@ const isSecondInstance = app.makeSingleInstance((argv, workingDirectory) => {
     mainWindow.focus();
   }
 });
-
-if (isSecondInstance) {
-  quitApp();
-}
 
 app.setAsDefaultProtocolClient('ss');
 
@@ -209,15 +222,14 @@ app.on('ready', () => {
   if (debugMode) {
     Menu.setApplicationMenu(Menu.buildFromTemplate([{
       label: 'Developer',
-      submenu: [{role: 'reload'}, {role: 'forcereload'}, {role: 'toggledevtools'}]
+      submenu: Menu.buildFromTemplate(
+          [{role: 'reload'}, {role: 'forceReload'}, {role: 'toggleDevTools'}])
     }]));
   } else {
-    // TODO: Run this periodically, e.g. every 4-6 hours.
-    try {
-      autoUpdater.checkForUpdates();
-    } catch (e) {
-      console.error(`Failed to check for updates`, e);
-    }
+    checkForUpdates();
+
+    // Check every six hours
+    setInterval(checkForUpdates, 6 * 60 * 60 * 1000);
   }
 
   // Set the app to launch at startup to connect automatically in case of a showdown while proxying.
@@ -252,6 +264,7 @@ app.on('ready', () => {
         .catch((e) => {
           // No connection at shutdown, or failure - either way, no need to start.
           // TODO: Instead of quitting, how about creating the system tray icon?
+          console.log(`${Options.AUTOSTART} was passed but we were not connected at shutdown - exiting`);
           app.quit();
         });
   } else {
@@ -267,14 +280,9 @@ app.on('activate', () => {
   }
 });
 
-app.on('quit', () => {
-  process_manager.teardownVpn().catch((e) => {
-    console.error(`could not tear down proxy on exit`, e);
-  });
-});
-
 promiseIpc.on('is-reachable', (config: cordova.plugins.outline.ServerConfig) => {
-  return connectivity.isServerReachable(config)
+  return connectivity
+      .isServerReachable(config.host || '', config.port || 0, REACHABILITY_TIMEOUT_MS)
       .then(() => {
         return true;
       })
@@ -283,33 +291,47 @@ promiseIpc.on('is-reachable', (config: cordova.plugins.outline.ServerConfig) => 
       });
 });
 
-function startVpn(config: cordova.plugins.outline.ServerConfig, id: string, isAutoConnect = false) {
-  return process_manager.teardownVpn()
-      .catch((e) => {
-        console.error(`error tearing down the VPN`, e);
-      })
-      .then(() => {
-        return process_manager
-            .startVpn(
-                config,
-                (status: ConnectionStatus) => {
-                  createTrayIcon(status);
-                  sendConnectionStatus(status, id);
-                  if (status === ConnectionStatus.DISCONNECTED) {
-                    connectionStore.clear().catch((err) => {
-                      console.error('Failed to clear connection store.');
-                    });
-                  }
-                },
-                isAutoConnect)
-            .then((newConfig) => {
-              connectionStore.save({config: newConfig, id}).catch((err) => {
-                console.error('Failed to store connection.');
-              });
-              sendConnectionStatus(ConnectionStatus.CONNECTED, id);
-              createTrayIcon(ConnectionStatus.CONNECTED);
-            });
-      });
+// Invoked by both the start-proxying event handler and auto-connect.
+async function startVpn(
+    config: cordova.plugins.outline.ServerConfig, id: string, isAutoConnect = false) {
+  if (currentConnection) {
+    throw new Error('already connected');
+  }
+
+  currentConnection = new ConnectionManager(config, isAutoConnect);
+
+  currentConnection.onceStopped.then(() => {
+    console.log(`disconnected from ${id}`);
+    currentConnection = undefined;
+    sendConnectionStatus(ConnectionStatus.DISCONNECTED, id);
+  });
+
+  currentConnection.onReconnecting = () => {
+    console.log(`reconnecting to ${id}`);
+    sendConnectionStatus(ConnectionStatus.RECONNECTING, id);
+  };
+
+  currentConnection.onReconnected = () => {
+    console.log(`reconnected to ${id}`);
+    sendConnectionStatus(ConnectionStatus.CONNECTED, id);
+  };
+
+  await currentConnection.start();
+  sendConnectionStatus(ConnectionStatus.CONNECTED, id);
+}
+
+// Invoked by both the stop-proxying event and quit handler.
+async function stopVpn() {
+  if (!currentConnection) {
+    return;
+  }
+
+  connectionStore.clear().catch((e) => {
+    console.error('Failed to clear connection store.');
+  });
+
+  currentConnection.stop();
+  await currentConnection.onceStopped;
 }
 
 function sendConnectionStatus(status: ConnectionStatus, connectionId: string) {
@@ -334,19 +356,46 @@ function sendConnectionStatus(status: ConnectionStatus, connectionId: string) {
   } else {
     console.warn(`received ${event} event but no mainWindow to notify`);
   }
+  createTrayIcon(status);
 }
 
+// Connects to the specified server, if that server is reachable and the credentials are valid.
 promiseIpc.on(
-    'start-proxying', (args: {config: cordova.plugins.outline.ServerConfig, id: string}) => {
-      return startVpn(args.config, args.id).catch((e) => {
+    'start-proxying', async (args: {config: cordova.plugins.outline.ServerConfig, id: string}) => {
+      // TODO: Rather than first disconnecting, implement a more efficient switchover (as well as
+      //       being faster, this would help prevent traffic leaks - the Cordova clients already do
+      //       this).
+      if (currentConnection) {
+        console.log('disconnecting from current server...');
+        currentConnection.stop();
+        await currentConnection.onceStopped;
+      }
+
+      console.log(`connecting to ${args.id}...`);
+
+      try {
+        // Rather than repeadedly resolving a hostname in what may be a fingerprint-able way,
+        // resolve it just once, upfront.
+        args.config.host = await connectivity.lookupIp(args.config.host || '');
+
+        await connectivity.isServerReachable(
+            args.config.host || '', args.config.port || 0, REACHABILITY_TIMEOUT_MS);
+        await startVpn(args.config, args.id);
+
+        console.log(`connected to ${args.id}`);
+
+        // Auto-connect requires IPs; the hostname in here has already been resolved (see above).
+        connectionStore.save(args).catch((e) => {
+          console.error('Failed to store connection.');
+        });
+      } catch (e) {
         console.error(`could not connect: ${e.name} (${e.message})`);
         throw errors.toErrorCode(e);
-      });
+      }
     });
 
-promiseIpc.on('stop-proxying', () => {
-  return process_manager.teardownVpn();
-});
+// Disconnects from the current server, if any.
+promiseIpc.on('stop-proxying', stopVpn);
 
 // This event fires whenever the app's window receives focus.
 app.on('browser-window-focus', () => {
@@ -371,6 +420,14 @@ ipcMain.on('localizationResponse', (event: Event, localizationResult: {[key: str
   }
   createTrayIcon(ConnectionStatus.DISCONNECTED);
 });
+
+function checkForUpdates() {
+  try {
+    autoUpdater.checkForUpdates();
+  } catch (e) {
+    console.error(`Failed to check for updates`, e);
+  }
+}
 
 // Notify the UI of updates.
 autoUpdater.on('update-downloaded', (ev, info) => {

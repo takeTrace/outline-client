@@ -23,18 +23,26 @@ yarn do src/electron/package_common
 
 scripts/environment_json.sh -r -p windows > www/environment.json
 
-# TODO: Share code with environment_json.sh (this is the dev/debug Sentry DSN).
+# Build the Sentry URL for the installer by parsing the API key and project ID from $SENTRY_DSN,
+# which has the following format: https://[32_CHAR_API_KEY]@sentry.io/[PROJECT_ID].
+readonly API_KEY=$(echo $SENTRY_DSN | awk -F/ '{print substr($3, 0, 32)}')
+readonly PROJECT_ID=$(echo $SENTRY_DSN | awk -F/ '{print $4}')
+readonly SENTRY_URL="https://sentry.io/api/$PROJECT_ID/store/?sentry_version=7&sentry_key=$API_KEY"
+
 # TODO: Move env.sh to build/electron/.
 cat > build/env.nsh << EOF
 !define RELEASE "$(scripts/semantic_version.sh -p windows)"
-!define SENTRY_DSN "https://sentry.io/api/159502/store/?sentry_version=7&sentry_key=6a1e6e7371a64db59f5ba6c34a77d78c"
+!define SENTRY_URL "${SENTRY_URL}"
 EOF
 
+# Publishing is disabled, updates are pulled from AWS. We use the generic provider instead of the S3
+# provider since the S3 provider uses "virtual-hosted style" URLs (my-bucket.s3.amazonaws.com)
+# which can be blocked by DNS or SNI without taking down other buckets.
 electron-builder \
   --win \
   --publish never \
   --config src/electron/electron-builder.json \
   --config.extraMetadata.version=$(scripts/semantic_version.sh -p windows) \
+  --config.win.certificateSubjectName='Jigsaw Operations LLC' \
   --config.publish.provider=generic \
-  --config.publish.url=https://raw.githubusercontent.com/Jigsaw-Code/outline-releases/master/client/ \
-  --config.win.certificateSubjectName='Jigsaw Operations LLC'
+  --config.publish.url=https://s3.amazonaws.com/outline-releases/client/windows

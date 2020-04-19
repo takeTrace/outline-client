@@ -25,6 +25,7 @@ import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.net.ConnectivityManager;
 import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.NetworkRequest;
 import android.net.VpnService;
@@ -154,29 +155,28 @@ public class VpnTunnelService extends VpnService {
       throw new IllegalArgumentException("Must provide a connection ID and configuration.");
     }
     final boolean isRestart = activeConnectionId != null;
-    final boolean isNewConnection = !connectionId.equals(activeConnectionId);
-    OutlinePlugin.ErrorCode errorCode = OutlinePlugin.ErrorCode.NO_ERROR;
-    if (isNewConnection) {
+    if (isRestart) {
       // Broadcast the previous instance disconnect event before reassigning the connection ID.
       broadcastVpnConnectivityChange(OutlinePlugin.ConnectionStatus.DISCONNECTED);
       stopForeground();
-      try {
-        // Only (re)start Shadowsocks if this is a new connection.
-        // Do not perform connectivity checks when connecting on startup. We should avoid failing
-        // the connection due to a network error, as network may not be ready.
-        errorCode = startShadowsocks(config, !isAutoStart).get();
-        if (!(errorCode == OutlinePlugin.ErrorCode.NO_ERROR
-                || errorCode == OutlinePlugin.ErrorCode.UDP_RELAY_NOT_ENABLED)) {
-          onVpnStartFailure(errorCode);
-          return;
-        }
-      } catch (Exception e) {
-        onVpnStartFailure(OutlinePlugin.ErrorCode.SHADOWSOCKS_START_FAILURE);
-        return;
-      }
     }
     activeConnectionId = connectionId;
     activeServerConfig = config;
+
+    OutlinePlugin.ErrorCode errorCode = OutlinePlugin.ErrorCode.NO_ERROR;
+    try {
+      // Do not perform connectivity checks when connecting on startup. We should avoid failing
+      // the connection due to a network error, as network may not be ready.
+      errorCode = startShadowsocks(config, !isAutoStart).get();
+      if (!(errorCode == OutlinePlugin.ErrorCode.NO_ERROR
+              || errorCode == OutlinePlugin.ErrorCode.UDP_RELAY_NOT_ENABLED)) {
+        onVpnStartFailure(errorCode);
+        return;
+      }
+    } catch (Exception e) {
+      onVpnStartFailure(OutlinePlugin.ErrorCode.SHADOWSOCKS_START_FAILURE);
+      return;
+    }
 
     if (isRestart) {
       vpnTunnel.disconnectTunnel();
@@ -190,7 +190,7 @@ public class VpnTunnelService extends VpnService {
       startNetworkConnectivityMonitor();
     }
 
-    final boolean remoteUdpForwardingEnabled = !isNewConnection || isAutoStart
+    final boolean remoteUdpForwardingEnabled = isAutoStart
         ? connectionStore.isUdpSupported()
         : errorCode == OutlinePlugin.ErrorCode.NO_ERROR;
     try {
@@ -365,7 +365,7 @@ public class VpnTunnelService extends VpnService {
         return;
       }
       broadcastVpnConnectivityChange(OutlinePlugin.ConnectionStatus.CONNECTED);
-      startForegroundWithNotification(null, OutlinePlugin.ConnectionStatus.CONNECTED);
+      startForegroundWithNotification(activeServerConfig, OutlinePlugin.ConnectionStatus.CONNECTED);
 
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
         // Indicate that traffic will be sent over the current active network.
@@ -398,7 +398,8 @@ public class VpnTunnelService extends VpnService {
         return;
       }
       broadcastVpnConnectivityChange(OutlinePlugin.ConnectionStatus.RECONNECTING);
-      startForegroundWithNotification(null, OutlinePlugin.ConnectionStatus.RECONNECTING);
+      startForegroundWithNotification(
+          activeServerConfig, OutlinePlugin.ConnectionStatus.RECONNECTING);
 
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
         setUnderlyingNetworks(null);
@@ -409,8 +410,17 @@ public class VpnTunnelService extends VpnService {
   private void startNetworkConnectivityMonitor() {
     final ConnectivityManager connectivityManager =
         (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-    NetworkRequest.Builder builder = new NetworkRequest.Builder();
-    connectivityManager.registerNetworkCallback(builder.build(), networkConnectivityMonitor);
+    NetworkRequest request = new NetworkRequest.Builder()
+                                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                                 .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                                 .build();
+    // `registerNetworkCallback` returns the VPN interface as the default network since Android P.
+    // Use `requestNetwork` instead (requires android.permission.CHANGE_NETWORK_STATE).
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+      connectivityManager.registerNetworkCallback(request, networkConnectivityMonitor);
+    } else {
+      connectivityManager.requestNetwork(request, networkConnectivityMonitor);
+    }
   }
 
   private void stopNetworkConnectivityMonitor() {
@@ -476,6 +486,7 @@ public class VpnTunnelService extends VpnService {
     try {
       final JSONObject config = connection.getJSONObject(CONNECTION_CONFIG_KEY);
       // Start the service in the foreground as per Android 8+ background service execution limits.
+      // Requires android.permission.FOREGROUND_SERVICE since Android P.
       startForegroundWithNotification(config, OutlinePlugin.ConnectionStatus.RECONNECTING);
       startConnection(connection.getString(CONNECTION_ID_KEY),
           connection.getJSONObject(CONNECTION_CONFIG_KEY), true);
@@ -514,7 +525,7 @@ public class VpnTunnelService extends VpnService {
           ? "connected_server_state"
           : "reconnecting_server_state";
       notificationBuilder.setContentText(getStringResource(statusStringResourceId));
-      startForeground(NOTIFICATION_SERVICE_ID, notificationBuilder.getNotification());
+      startForeground(NOTIFICATION_SERVICE_ID, notificationBuilder.build());
     } catch (Exception e) {
       LOG.warning("Unable to display persistent notification");
     }
